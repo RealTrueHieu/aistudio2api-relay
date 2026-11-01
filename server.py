@@ -12,7 +12,6 @@ import urllib.request
 import urllib.error
 import http.server
 import http.client
-from urllib.parse import urlparse
 from cryptography.fernet import Fernet
 
 recent_logs = collections.deque(maxlen=2000)
@@ -65,7 +64,7 @@ def setup_auth():
 
 # 2. Start rotator and test connectivity
 def setup_proxies():
-    log("=== [3/5] Starting Proxy Rotator on 127.0.0.1:10800 ===")
+    log("=== [3/5] Starting Sticky Residential Proxy on 127.0.0.1:10800 ===")
     p = subprocess.Popen(
         ["python3", "-u", "/app/rotator.py"],
         stdout=subprocess.PIPE,
@@ -85,12 +84,12 @@ def setup_proxies():
             })
         )
         req = urllib.request.Request("https://api.ipify.org?format=json", headers={"User-Agent": "Mozilla/5.0"})
-        with opener.open(req, timeout=6) as r:
+        with opener.open(req, timeout=8) as r:
             res = r.read().decode("utf-8")
-            log(f"[+] Proxy confirmed working! Outbound IP: {res.strip()}")
+            log(f"[+] Sticky proxy confirmed working! Outbound IP: {res.strip()}")
             proxy_ok = True
     except Exception as e:
-        log(f"[!] Residential proxy test failed: {e}. Falling back to direct egress.")
+        log(f"[!] Sticky residential proxy test failed: {e}. Falling back to direct egress.")
 
     return "http://127.0.0.1:10800" if proxy_ok else ""
 
@@ -150,7 +149,6 @@ def trigger_start():
         return str(e)
 
 def supervisor_loop():
-    # Wait for service to be reachable on loopback
     log("[Supervisor] Waiting for aistudio2api HTTP listener on 127.0.0.1:2048...")
     started = False
     for _ in range(60):
@@ -167,13 +165,11 @@ def supervisor_loop():
         time.sleep(1)
         trigger_start()
 
-    # Periodic keep-alive & health check
     while True:
         time.sleep(15)
         try:
             with urllib.request.urlopen("http://127.0.0.1:2048/api/status", timeout=5) as r:
                 status_data = json.loads(r.read().decode("utf-8"))
-                # Check if running
                 svc_status = status_data.get("status") or status_data.get("service", {}).get("status")
                 if svc_status in ["stopped", "error"]:
                     log(f"[Supervisor] Service is {svc_status}! Restarting generation...")
@@ -186,8 +182,19 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format, *args):
-        # Suppress noisy standard request logging
         pass
+
+    def send_body(self, status, content_type, body_bytes):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+        self.wfile.write(body_bytes)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -195,44 +202,51 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
         self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
 
     def do_GET(self):
         if self.path == "/healthz":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(b'{"status":"healthy"}')
+            self.send_body(200, "application/json", b'{"status":"healthy"}')
             return
         elif self.path == "/debug/logs":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write("\n".join(recent_logs).encode("utf-8"))
+            self.send_body(200, "text/plain; charset=utf-8", "\n".join(recent_logs).encode("utf-8"))
             return
         elif self.path == "/debug/status":
             try:
                 with urllib.request.urlopen("http://127.0.0.1:2048/api/status", timeout=5) as r:
                     data = r.read()
-                    self.send_response(r.status)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    self.wfile.write(data)
+                    self.send_body(r.status, "application/json", data)
             except Exception as e:
-                self.send_response(502)
-                self.end_headers()
-                self.wfile.write(f"Error: {e}".encode("utf-8"))
+                self.send_body(502, "application/json", json.dumps({"error": str(e)}).encode("utf-8"))
             return
         elif self.path == "/debug/start":
             res = trigger_start()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps({"result": res}).encode("utf-8"))
+            self.send_body(200, "application/json", json.dumps({"result": res}).encode("utf-8"))
+            return
+        elif self.path == "/debug/test-google":
+            result = {}
+            # Direct
+            try:
+                req = urllib.request.Request("https://aistudio.google.com/", headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    result["direct"] = f"HTTP {r.status} (url={r.url})"
+            except Exception as e:
+                result["direct"] = f"FAIL: {e}"
+
+            # Via Proxy
+            try:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": "http://127.0.0.1:10800", "https": "http://127.0.0.1:10800"})
+                )
+                req = urllib.request.Request("https://aistudio.google.com/", headers={"User-Agent": "Mozilla/5.0"})
+                with opener.open(req, timeout=8) as r:
+                    result["proxy"] = f"HTTP {r.status} (url={r.url})"
+            except Exception as e:
+                result["proxy"] = f"FAIL: {e}"
+
+            self.send_body(200, "application/json", json.dumps(result, indent=2).encode("utf-8"))
             return
 
         self.forward_request("GET")
@@ -240,11 +254,7 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/debug/start":
             res = trigger_start()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps({"result": res}).encode("utf-8"))
+            self.send_body(200, "application/json", json.dumps({"result": res}).encode("utf-8"))
             return
         self.forward_request("POST")
 
@@ -255,11 +265,9 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
         self.forward_request("DELETE")
 
     def forward_request(self, method):
-        # Read request body if present
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else None
 
-        # Build upstream headers
         hop_by_hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                       "te", "trailers", "transfer-encoding", "upgrade", "host"}
         upstream_headers = {k: v for k, v in self.headers.items() if k.lower() not in hop_by_hop}
@@ -270,7 +278,6 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
             conn.request(method, self.path, body=body, headers=upstream_headers)
             resp = conn.getresponse()
 
-            # If 503 service stopped, auto trigger start in background
             if resp.status == 503:
                 threading.Thread(target=trigger_start, daemon=True).start()
 
@@ -280,9 +287,9 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
                     self.send_header(k, v)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Connection", "close")
+            self.close_connection = True
             self.end_headers()
 
-            # Stream body chunks to client
             while True:
                 chunk = resp.read(2048)
                 if not chunk:
@@ -297,11 +304,7 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             log(f"[Proxy] Forward error for {method} {self.path}: {e}")
             try:
-                self.send_response(502)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": f"Upstream proxy error: {e}"}).encode("utf-8"))
+                self.send_body(502, "application/json", json.dumps({"error": f"Upstream error: {e}"}).encode("utf-8"))
             except Exception:
                 pass
 

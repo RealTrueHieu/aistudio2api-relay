@@ -11,9 +11,10 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 10800
 
 proxies = []
+sticky_proxy = None
 
 def load_proxies():
-    global proxies
+    global proxies, sticky_proxy
     path = PROXIES_FILE
     if not os.path.exists(path):
         path = "proxies.txt"
@@ -38,6 +39,20 @@ def load_proxies():
                     "auth": auth
                 })
     print(f"[*] Loaded {len(proxies)} proxies into pool.", flush=True)
+    if proxies:
+        sticky_proxy = proxies[0]
+        print(f"[*] Default sticky proxy set to: {sticky_proxy['host']}:{sticky_proxy['port']}", flush=True)
+
+def get_proxy():
+    global sticky_proxy
+    return sticky_proxy if sticky_proxy else (random.choice(proxies) if proxies else None)
+
+def failover_proxy():
+    global sticky_proxy
+    if len(proxies) > 1:
+        old = f"{sticky_proxy['host']}:{sticky_proxy['port']}" if sticky_proxy else "none"
+        sticky_proxy = random.choice(proxies)
+        print(f"[!] Failover sticky proxy from {old} to {sticky_proxy['host']}:{sticky_proxy['port']}", flush=True)
 
 async def pipe(r, w):
     try:
@@ -77,7 +92,7 @@ async def handle_client(client_r, client_w):
         client_w.close()
         return
 
-    # Try up to 4 proxies in case one is dead/slow
+    # Use sticky proxy for session consistency
     if method.upper() == "CONNECT":
         if ":" in target:
             target_host, target_port = target.split(":", 1)
@@ -85,12 +100,12 @@ async def handle_client(client_r, client_w):
             target_host, target_port = target, "443"
 
         connected = False
-        for attempt in range(4):
-            proxy = random.choice(proxies)
+        for attempt in range(3):
+            proxy = get_proxy()
             try:
                 proxy_r, proxy_w = await asyncio.wait_for(
                     asyncio.open_connection(proxy["host"], proxy["port"]),
-                    timeout=6
+                    timeout=8
                 )
                 
                 connect_req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
@@ -101,7 +116,7 @@ async def handle_client(client_r, client_w):
                 proxy_w.write(connect_req.encode("utf-8"))
                 await proxy_w.drain()
 
-                proxy_resp = await asyncio.wait_for(proxy_r.readuntil(b"\r\n\r\n"), timeout=6)
+                proxy_resp = await asyncio.wait_for(proxy_r.readuntil(b"\r\n\r\n"), timeout=8)
                 if b"200" in proxy_resp.split(b"\r\n")[0]:
                     client_w.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     await client_w.drain()
@@ -110,7 +125,9 @@ async def handle_client(client_r, client_w):
                     break
                 else:
                     proxy_w.close()
+                    failover_proxy()
             except Exception:
+                failover_proxy()
                 continue
 
         if not connected:
@@ -121,14 +138,13 @@ async def handle_client(client_r, client_w):
             except Exception:
                 pass
     else:
-        # Standard HTTP forwarding
         connected = False
-        for attempt in range(4):
-            proxy = random.choice(proxies)
+        for attempt in range(3):
+            proxy = get_proxy()
             try:
                 proxy_r, proxy_w = await asyncio.wait_for(
                     asyncio.open_connection(proxy["host"], proxy["port"]),
-                    timeout=6
+                    timeout=8
                 )
                 forward_head = head
                 if proxy["auth"]:
@@ -139,6 +155,7 @@ async def handle_client(client_r, client_w):
                 connected = True
                 break
             except Exception:
+                failover_proxy()
                 continue
 
         if not connected:
@@ -147,7 +164,7 @@ async def handle_client(client_r, client_w):
 async def main():
     load_proxies()
     server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT)
-    print(f"[*] Proxy Rotator listening on {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
+    print(f"[*] Sticky Residential Proxy listening on {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
     async with server:
         await server.serve_forever()
 
