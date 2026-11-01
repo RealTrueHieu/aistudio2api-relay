@@ -21,10 +21,8 @@ RUN curl -fsSL -o aistudio2api.tar.gz https://github.com/Mag1cFall/AIStudio2API/
 
 COPY rotator.py /app/rotator.py
 COPY bundle.enc /app/bundle.enc
-COPY entrypoint.sh /app/entrypoint.sh
-
-RUN chmod +x /app/entrypoint.sh
+COPY server.py /app/server.py
 
 EXPOSE 10000
 
-ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]
+ENTRYPOINT ["python3", "-u", "/app/server.py"]
