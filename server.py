@@ -148,6 +148,29 @@ def trigger_start():
         log(f"[Supervisor] Error triggering start: {e}")
         return str(e)
 
+def clear_all_cooldowns():
+    try:
+        req = urllib.request.Request("http://127.0.0.1:2048/api/cooldowns")
+        with urllib.request.urlopen(req, timeout=3) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        count = 0
+        for item in data.get("cooldowns", []):
+            acc_id = item.get("account_id")
+            scope = item.get("scope")
+            if acc_id and scope:
+                del_url = f"http://127.0.0.1:2048/api/accounts/{acc_id}/cooldowns/{scope}"
+                del_req = urllib.request.Request(del_url, method="DELETE")
+                try:
+                    with urllib.request.urlopen(del_req, timeout=2):
+                        count += 1
+                except Exception:
+                    pass
+        if count > 0:
+            log(f"[Supervisor] Auto-cleared {count} cooldowns from accounts!")
+        return count
+    except Exception as e:
+        return 0
+
 def supervisor_loop():
     log("[Supervisor] Waiting for aistudio2api HTTP listener on 127.0.0.1:2048...")
     started = False
@@ -165,8 +188,14 @@ def supervisor_loop():
         time.sleep(1)
         trigger_start()
 
+    loop_count = 0
     while True:
         time.sleep(15)
+        loop_count += 1
+        # Every 60s, clear false-positive / stale cooldowns
+        if loop_count % 4 == 0:
+            clear_all_cooldowns()
+
         try:
             with urllib.request.urlopen("http://127.0.0.1:2048/api/status", timeout=5) as r:
                 status_data = json.loads(r.read().decode("utf-8"))
@@ -225,9 +254,12 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
             res = trigger_start()
             self.send_body(200, "application/json", json.dumps({"result": res}).encode("utf-8"))
             return
+        elif self.path == "/debug/clear-cooldowns":
+            cnt = clear_all_cooldowns()
+            self.send_body(200, "application/json", json.dumps({"cleared_count": cnt}).encode("utf-8"))
+            return
         elif self.path == "/debug/test-google":
             result = {}
-            # Direct
             try:
                 req = urllib.request.Request("https://aistudio.google.com/", headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=5) as r:
@@ -235,7 +267,6 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 result["direct"] = f"FAIL: {e}"
 
-            # Via Proxy
             try:
                 opener = urllib.request.build_opener(
                     urllib.request.ProxyHandler({"http": "http://127.0.0.1:10800", "https": "http://127.0.0.1:10800"})
@@ -255,6 +286,10 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/debug/start":
             res = trigger_start()
             self.send_body(200, "application/json", json.dumps({"result": res}).encode("utf-8"))
+            return
+        elif self.path == "/debug/clear-cooldowns":
+            cnt = clear_all_cooldowns()
+            self.send_body(200, "application/json", json.dumps({"cleared_count": cnt}).encode("utf-8"))
             return
         self.forward_request("POST")
 
@@ -280,6 +315,8 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
 
             if resp.status == 503:
                 threading.Thread(target=trigger_start, daemon=True).start()
+            elif resp.status == 429:
+                threading.Thread(target=clear_all_cooldowns, daemon=True).start()
 
             self.send_response(resp.status)
             for k, v in resp.getheaders():
