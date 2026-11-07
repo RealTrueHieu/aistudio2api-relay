@@ -75,96 +75,129 @@ async def handle_client(client_r, client_w):
     try:
         head = await client_r.readuntil(b"\r\n\r\n")
     except Exception:
-        client_w.close()
+        try:
+            client_w.close()
+        except Exception:
+            pass
         return
 
     first_line = head.split(b"\r\n")[0].decode("utf-8", errors="replace")
     parts = first_line.split()
     if len(parts) < 2:
-        client_w.close()
+        try:
+            client_w.close()
+        except Exception:
+            pass
         return
 
     method, target = parts[0], parts[1]
-    
-    if not proxies:
-        client_w.write(b"HTTP/1.1 502 No Proxies Configured\r\n\r\n")
-        await client_w.drain()
-        client_w.close()
-        return
 
-    # Use sticky proxy for session consistency
+    # Handle CONNECT
     if method.upper() == "CONNECT":
         if ":" in target:
             target_host, target_port = target.split(":", 1)
         else:
             target_host, target_port = target, "443"
+        target_port_int = int(target_port) if target_port.isdigit() else 443
 
         connected = False
-        for attempt in range(3):
-            proxy = get_proxy()
+        # Try configured proxies if available
+        if proxies:
+            for attempt in range(min(2, len(proxies))):
+                proxy = get_proxy()
+                try:
+                    proxy_r, proxy_w = await asyncio.wait_for(
+                        asyncio.open_connection(proxy["host"], proxy["port"]),
+                        timeout=5
+                    )
+                    
+                    connect_req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
+                    if proxy["auth"]:
+                        connect_req += f"Proxy-Authorization: Basic {proxy['auth']}\r\n"
+                    connect_req += "\r\n"
+
+                    proxy_w.write(connect_req.encode("utf-8"))
+                    await proxy_w.drain()
+
+                    proxy_resp = await asyncio.wait_for(proxy_r.readuntil(b"\r\n\r\n"), timeout=5)
+                    if b"200" in proxy_resp.split(b"\r\n")[0]:
+                        client_w.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        await client_w.drain()
+                        await asyncio.gather(pipe(client_r, proxy_w), pipe(proxy_r, client_w))
+                        connected = True
+                        break
+                    else:
+                        proxy_w.close()
+                        failover_proxy()
+                except Exception:
+                    failover_proxy()
+                    continue
+
+        # If proxy failed or no proxies, fallback immediately to direct egress
+        if not connected:
             try:
-                proxy_r, proxy_w = await asyncio.wait_for(
-                    asyncio.open_connection(proxy["host"], proxy["port"]),
-                    timeout=8
+                direct_r, direct_w = await asyncio.wait_for(
+                    asyncio.open_connection(target_host, target_port_int),
+                    timeout=10
                 )
-                
-                connect_req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
-                if proxy["auth"]:
-                    connect_req += f"Proxy-Authorization: Basic {proxy['auth']}\r\n"
-                connect_req += "\r\n"
-
-                proxy_w.write(connect_req.encode("utf-8"))
-                await proxy_w.drain()
-
-                proxy_resp = await asyncio.wait_for(proxy_r.readuntil(b"\r\n\r\n"), timeout=8)
-                if b"200" in proxy_resp.split(b"\r\n")[0]:
-                    client_w.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                client_w.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await client_w.drain()
+                await asyncio.gather(pipe(client_r, direct_w), pipe(direct_r, client_w))
+                connected = True
+            except Exception as e:
+                print(f"[!] Direct connection to {target_host}:{target_port} failed: {e}", flush=True)
+                try:
+                    client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                     await client_w.drain()
+                    client_w.close()
+                except Exception:
+                    pass
+    else:
+        connected = False
+        if proxies:
+            for attempt in range(min(2, len(proxies))):
+                proxy = get_proxy()
+                try:
+                    proxy_r, proxy_w = await asyncio.wait_for(
+                        asyncio.open_connection(proxy["host"], proxy["port"]),
+                        timeout=5
+                    )
+                    forward_head = head
+                    if proxy["auth"]:
+                        forward_head = re.sub(b"\r\n\r\n", f"\r\nProxy-Authorization: Basic {proxy['auth']}\r\n\r\n".encode(), forward_head, count=1)
+                    proxy_w.write(forward_head)
+                    await proxy_w.drain()
                     await asyncio.gather(pipe(client_r, proxy_w), pipe(proxy_r, client_w))
                     connected = True
                     break
-                else:
-                    proxy_w.close()
+                except Exception:
                     failover_proxy()
-            except Exception:
-                failover_proxy()
-                continue
+                    continue
 
         if not connected:
             try:
-                client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                await client_w.drain()
-                client_w.close()
-            except Exception:
-                pass
-    else:
-        connected = False
-        for attempt in range(3):
-            proxy = get_proxy()
-            try:
-                proxy_r, proxy_w = await asyncio.wait_for(
-                    asyncio.open_connection(proxy["host"], proxy["port"]),
-                    timeout=8
+                p = urlparse(target if target.startswith("http") else f"http://{target}")
+                d_host = p.hostname or target.split(":")[0]
+                d_port = p.port or 80
+                direct_r, direct_w = await asyncio.wait_for(
+                    asyncio.open_connection(d_host, d_port),
+                    timeout=10
                 )
-                forward_head = head
-                if proxy["auth"]:
-                    forward_head = re.sub(b"\r\n\r\n", f"\r\nProxy-Authorization: Basic {proxy['auth']}\r\n\r\n".encode(), forward_head, count=1)
-                proxy_w.write(forward_head)
-                await proxy_w.drain()
-                await asyncio.gather(pipe(client_r, proxy_w), pipe(proxy_r, client_w))
+                direct_w.write(head)
+                await direct_w.drain()
+                await asyncio.gather(pipe(client_r, direct_w), pipe(direct_r, client_w))
                 connected = True
-                break
-            except Exception:
-                failover_proxy()
-                continue
-
-        if not connected:
-            client_w.close()
+            except Exception as e:
+                print(f"[!] Direct HTTP to {target} failed: {e}", flush=True)
+                try:
+                    client_w.close()
+                except Exception:
+                    pass
 
 async def main():
     load_proxies()
     server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT)
-    print(f"[*] Sticky Residential Proxy listening on {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
+    print(f"[*] Sticky Residential Proxy with Direct Fallback listening on {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
     async with server:
         await server.serve_forever()
 
