@@ -207,6 +207,52 @@ def supervisor_loop():
             pass
 
 # 5. Reverse Proxy Server
+FALLBACK_CHAINS = {
+    # Pro / Flagship family
+    "gemini-4-argon": ["gemini-4-argon", "gemini-4-argon-build", "gemini-3.1-pro-preview", "gemini-pro-latest", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest", "gemini-3.5-flash-lite"],
+    "gemini-4-argon-build": ["gemini-4-argon-build", "gemini-4-argon", "gemini-3.8-flash-build", "gemini-3.8-flash", "gemini-3.6-flash"],
+    "gemini-3.1-pro-preview": ["gemini-3.1-pro-preview", "gemini-pro-latest", "gemini-4-argon", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest"],
+    "gemini-pro-latest": ["gemini-pro-latest", "gemini-3.1-pro-preview", "gemini-4-argon", "gemini-3.8-flash", "gemini-3.6-flash"],
+    "gemini-2.5-pro": ["gemini-3.1-pro-preview", "gemini-pro-latest", "gemini-4-argon", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest"],
+    "gemini-1.5-pro": ["gemini-3.1-pro-preview", "gemini-pro-latest", "gemini-4-argon", "gemini-3.8-flash", "gemini-3.6-flash"],
+
+    # Flash / Speed family
+    "gemini-3.8-flash": ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-4-argon"],
+    "gemini-3.6-flash": ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+    "gemini-flash-latest": ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"],
+    "gemini-2.5-flash": ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-4-argon"],
+    "gemini-1.5-flash": ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest", "gemini-3.5-flash-lite"],
+
+    # Lite family
+    "gemini-3.5-flash-lite": ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-3.6-flash", "gemini-3.8-flash"],
+    "gemini-3.1-flash-lite": ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.6-flash", "gemini-3.8-flash"],
+    "gemini-flash-lite-latest": ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.6-flash"],
+
+    # Gemma family
+    "gemma-4-31b-it": ["gemma-4-31b-it", "gemma-4-26b-a4b-it", "gemini-3.8-flash", "gemini-3.6-flash"],
+    "gemma-4-26b-a4b-it": ["gemma-4-26b-a4b-it", "gemma-4-31b-it", "gemini-3.8-flash"]
+}
+
+DEFAULT_FALLBACK_POOL = [
+    "gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest",
+    "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-4-argon",
+    "gemini-3.1-pro-preview", "gemini-pro-latest"
+]
+
+def get_candidate_chain(orig_model):
+    clean = (orig_model or "").lower().replace("models/", "").replace("ais/", "").replace("ag/", "").strip()
+    chain = []
+    for k, v in FALLBACK_CHAINS.items():
+        if k == clean or k in clean or clean in k:
+            for m in v:
+                if m not in chain: chain.append(m)
+            break
+    if not chain and clean:
+        chain.append(clean)
+    for m in DEFAULT_FALLBACK_POOL:
+        if m not in chain: chain.append(m)
+    return chain[:6]
+
 class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -308,42 +354,89 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
         upstream_headers = {k: v for k, v in self.headers.items() if k.lower() not in hop_by_hop}
         upstream_headers["Host"] = "127.0.0.1:2048"
 
-        try:
-            conn = http.client.HTTPConnection("127.0.0.1", 2048, timeout=180)
-            conn.request(method, self.path, body=body, headers=upstream_headers)
-            resp = conn.getresponse()
-
-            if resp.status == 503:
-                threading.Thread(target=trigger_start, daemon=True).start()
-            elif resp.status == 429:
-                threading.Thread(target=clear_all_cooldowns, daemon=True).start()
-
-            self.send_response(resp.status)
-            for k, v in resp.getheaders():
-                if k.lower() not in ["transfer-encoding", "connection"]:
-                    self.send_header(k, v)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Connection", "close")
-            self.close_connection = True
-            self.end_headers()
-
-            while True:
-                chunk = resp.read(2048)
-                if not chunk:
-                    break
-                try:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    break
-
-            conn.close()
-        except Exception as e:
-            log(f"[Proxy] Forward error for {method} {self.path}: {e}")
+        is_chat = method == "POST" and self.path in ["/v1/chat/completions", "/v1/messages"]
+        body_dict = None
+        orig_model = ""
+        candidates = []
+        if is_chat and body:
             try:
-                self.send_body(502, "application/json", json.dumps({"error": f"Upstream error: {e}"}).encode("utf-8"))
+                body_dict = json.loads(body.decode("utf-8"))
+                orig_model = body_dict.get("model", "")
+                candidates = get_candidate_chain(orig_model)
             except Exception:
-                pass
+                body_dict = None
+
+        if not candidates:
+            candidates = [orig_model] if orig_model else [""]
+
+        last_status = 502
+        last_body = b""
+        last_headers = []
+
+        for candidate_model in candidates:
+            current_body = body
+            curr_headers = dict(upstream_headers)
+            if body_dict is not None and candidate_model:
+                body_dict["model"] = candidate_model
+                current_body = json.dumps(body_dict).encode("utf-8")
+                curr_headers["Content-Length"] = str(len(current_body))
+
+            conn = None
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", 2048, timeout=180)
+                conn.request(method, self.path, body=current_body, headers=curr_headers)
+                resp = conn.getresponse()
+
+                if resp.status == 503:
+                    threading.Thread(target=trigger_start, daemon=True).start()
+
+                # If this model returned 429 quota exhaustion, immediately try next candidate!
+                if resp.status == 429:
+                    err_bytes = resp.read()
+                    conn.close()
+                    log(f"[Auto-Fallback] Model '{candidate_model}' hit HTTP 429 quota exhaustion. Auto-falling back to alternative...")
+                    threading.Thread(target=clear_all_cooldowns, daemon=True).start()
+                    last_status = 429
+                    last_body = err_bytes
+                    continue
+
+                self.send_response(resp.status)
+                for k, v in resp.getheaders():
+                    if k.lower() not in ["transfer-encoding", "connection"]:
+                        self.send_header(k, v)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Connection", "close")
+                if candidate_model != orig_model and orig_model:
+                    self.send_header("x-fallback-from", orig_model)
+                    self.send_header("x-fallback-to", candidate_model)
+                self.close_connection = True
+                self.end_headers()
+
+                while True:
+                    chunk = resp.read(2048)
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+
+                conn.close()
+                return
+            except Exception as e:
+                log(f"[Proxy] Candidate '{candidate_model}' error for {method} {self.path}: {e}")
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                last_status = 502
+                last_body = json.dumps({"error": f"Upstream error on candidate {candidate_model}: {e}"}).encode("utf-8")
+                continue
+
+        # If all candidates in chain failed:
+        self.send_body(last_status, "application/json", last_body if last_body else b'{"error":"All models exhausted"}')
 
 def run():
     setup_auth()
