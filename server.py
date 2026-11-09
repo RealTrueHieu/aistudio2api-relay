@@ -12,6 +12,8 @@ import urllib.request
 import urllib.error
 import http.server
 import http.client
+import socket
+import select
 from cryptography.fernet import Fernet
 
 recent_logs = collections.deque(maxlen=2000)
@@ -345,7 +347,47 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self):
         self.forward_request("DELETE")
 
+    def proxy_websocket(self):
+        try:
+            upstream = socket.create_connection(("127.0.0.1", 2048), timeout=10)
+            req_lines = [f"{self.command} {self.path} HTTP/1.1"]
+            for k, v in self.headers.items():
+                if k.lower() == "host":
+                    req_lines.append("Host: 127.0.0.1:2048")
+                else:
+                    req_lines.append(f"{k}: {v}")
+            req_lines.append("\r\n")
+            upstream.sendall("\r\n".join(req_lines).encode("utf-8"))
+
+            client_sock = self.connection
+            client_sock.setblocking(False)
+            upstream.setblocking(False)
+
+            sockets = [client_sock, upstream]
+            while True:
+                r, _, x = select.select(sockets, [], sockets, 60)
+                if x:
+                    break
+                if not r:
+                    continue
+                for s in r:
+                    data = s.recv(65536)
+                    if not data:
+                        return
+                    if s is client_sock:
+                        upstream.sendall(data)
+                    else:
+                        client_sock.sendall(data)
+        except Exception as e:
+            log(f"[WebSocket Proxy] Closed: {e}")
+        finally:
+            self.close_connection = True
+
     def forward_request(self, method):
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            self.proxy_websocket()
+            return
+
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else None
 
