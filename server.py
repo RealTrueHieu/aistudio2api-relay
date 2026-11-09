@@ -405,6 +405,10 @@ class ReverseProxyHandler(http.server.BaseHTTPRequestHandler):
                 body_dict = json.loads(body.decode("utf-8"))
                 orig_model = body_dict.get("model", "")
                 candidates = get_candidate_chain(orig_model)
+                # Ensure reasoning models never starve if client passes tiny max_tokens
+                for k in ["max_tokens", "max_output_tokens", "max_completion_tokens"]:
+                    if k in body_dict and isinstance(body_dict[k], (int, float)) and body_dict[k] < 1024:
+                        body_dict[k] = 4096
             except Exception:
                 body_dict = None
 
